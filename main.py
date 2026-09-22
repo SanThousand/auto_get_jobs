@@ -1,8 +1,4 @@
-from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.wait import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+from DrissionPage import ChromiumPage, ChromiumOptions
 from bs4 import BeautifulSoup
 from aiconfig import ai_response, ai_hr
 from dotenv import load_dotenv
@@ -10,52 +6,44 @@ import os
 import random
 import time
 import json
+import urllib.parse
 
 load_dotenv()
 
-options = webdriver.ChromeOptions()
-options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36')
-options.add_argument('--disable-blink-features=AutomationControlled')
-options.add_experimental_option('excludeSwitches', ['enable-automation'])
-driver_path = os.path.join("chromedriver", "chromedriver.exe")
-wb = webdriver.Chrome(service=Service(driver_path),options=options)
+co = ChromiumOptions()
+co.set_user_data_path(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'chrome_profile'))
+co.set_user_agent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36')
+page = ChromiumPage(co)
 
 def login():
     """
     登录BOSS直聘
     """
-    #登录URl
     login_url = "https://www.zhipin.com/web/user/?ka=header-login"
-    wb.get(login_url)
-    #等待用户登录登录成功跳转主页
+    page.get(login_url)
     try:
-        print(f"等待登陆...")
-        WebDriverWait(wb, 60).until(
-            EC.url_to_be(("https://www.zhipin.com/web/geek/job-recommend")) or
-            EC.url_to_be(("https://www.zhipin.com"))
-        )
-        print(f"登陆成功，自动跳转到主页。")
+        print("等待登陆...")
+        page.wait.url_change(login_url, timeout=60)
+        print("登陆成功，自动跳转到主页。")
     except Exception as e:
         print(f"页面跳转失败: {e}")
     return
+
 def search(query, city, degree = None):
     """
-    构造搜索URL
+    构造搜索URL并打开搜索页
     :param query: 职位
     :param city: 城市
     """
-    
     cityid = get_cityid(city)
-    serch_url = f"https://www.zhipin.com/web/geek/job?query={query}&city={cityid}"
+    serch_url = f"https://www.zhipin.com/web/geek/jobs?query={urllib.parse.quote(query)}&city={cityid}"
     if degree:
         serch_url += f"&degree={degree}"
-    wb.get(serch_url)
+    page.get(serch_url)
     try:
-        print(f"等待页面加载完成...")
-        WebDriverWait(wb, 60).until(
-            EC.presence_of_element_located((By.CLASS_NAME, "search-job-result"))
-        )
-        print(f"页面加载完成，开始筛选岗位。")
+        print("等待页面加载完成...")
+        page.wait.ele_displayed('css:.job-list-container', timeout=60)
+        print("页面加载完成，开始筛选岗位。")
     except Exception as e:
         print(f"页面加载失败: {e}")
     return
@@ -66,146 +54,123 @@ def get_cityid(city):
     """
     cityid_dict = json.load(open("city_list.json", "r", encoding="utf-8"))
     cityid = cityid_dict[city]
-    
     return cityid
 
-def get_job_info():
+def fetch_joblist(query, city, degree, page_num):
     """
-    获取岗位信息
+    在页面上下文里同步调用搜索接口获取岗位JSON
+    """
+    q = urllib.parse.quote(query)
+    js = f"""
+    var xhr = new XMLHttpRequest();
+    xhr.open('POST', '/wapi/zpgeek/search/joblist.json', false);
+    xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+    xhr.send('page={page_num}&pageSize=15&city={city}&degree={degree}&query={q}&scene=1');
+    return xhr.responseText;
+    """
+    return json.loads(page.run_js(js))
+
+def get_job_info(query, cityid, degree, seen_links):
+    """
+    通过搜索接口获取岗位信息（薪资为真实文本）。
+    seen_links 跨 query 共享：连续两页零新增时提前结束，避免重复采集。
     """
     jobs = []
+    page_num = 1
+    zero_new_pages = 0
     while True:
-        
-        WebDriverWait(wb, 120).until(
-            EC.presence_of_element_located((By.CLASS_NAME, "job-name"))
-        )
-        time.sleep(random.uniform(3, 5))
-        html_content = wb.page_source 
-        soup = BeautifulSoup(html_content, "html.parser")
-        #找到所有的岗位信息块
-        job_cards = soup.find_all('li', class_='job-card-wrapper')
-        # print(job_cards)
-        
-        for job_card in job_cards:
-            #岗位名称
-            job_name = job_card.find('span', class_="job-name").text.strip()
-            # print(job_name)
-            #薪资
-            job_salary = job_card.find('span', class_="salary").text.strip()
-            #岗位链接
-            job_link = job_card.find('a', class_ = 'job-card-left')['href']
-            
-            jobs.append({
-                'job_name': job_name,
-                'job_salary': job_salary,
-                'job_link': job_link
-            })
-            # print(f"当前岗位数量：{len(jobs)}")
-            
-        # 下一页按钮的位置
         try:
-            next_page_button = wb.find_element(By.CLASS_NAME, "ui-icon-arrow-right")
-            print("开始采集下一页")
-            if "disabled" in next_page_button.find_element(By.XPATH, "..").get_attribute("class"):
-                print("没有下一页了，退出循环。")
+            data = fetch_joblist(query, cityid, degree, page_num)
+            zp = data.get('zpData') or {}
+            job_list = zp.get('jobList') or []
+        except Exception as e:
+            print(f"第{page_num}页接口调用失败: {e}")
+            break
+        new_count = 0
+        for item in job_list:
+            job_link = f"/job_detail/{item.get('encryptJobId')}.html"
+            if job_link in seen_links:
+                continue
+            seen_links.add(job_link)
+            new_count += 1
+            jobs.append({
+                'job_name': item.get('jobName', ''),
+                'job_salary': item.get('salaryDesc', ''),
+                'job_link': job_link,
+                'skills': item.get('skills') or [],
+                'city_name': item.get('cityName', ''),
+                'brand_name': item.get('brandName', ''),
+            })
+        print(f"第{page_num}页返回 {len(job_list)} 个岗位，新增 {new_count} 个，累计 {len(jobs)} 个。")
+        if not zp.get('hasMore'):
+            print("没有更多页了，采集结束。")
+            break
+        if new_count == 0:
+            zero_new_pages += 1
+            if zero_new_pages >= 2:
+                print("连续两页岗位全部重复，该关键词已被之前采集覆盖，提前结束。")
                 break
-            wb.execute_script("arguments[0].click();", next_page_button)
-        except:
-            print("没有下一页按钮，退出循环。")
-            break    
+        else:
+            zero_new_pages = 0
+        page_num += 1
+        time.sleep(random.uniform(3, 6))
     return jobs
 
 
-def check_position_match(query, my_job_salary):
+def ai_filter(jobs):
     """
-    检索岗位是否匹配
-    query: 岗位名称
-    my_job_salary: 我的期望薪资
+    AI初筛：只保留适合第一份实习的Java/后端岗位
     """
-    jobs = get_job_info()
-    print(f"根据当前数据，城市中总共有 {len(jobs)} 个岗位可供选择。")
-    position_matchs = []
+    matched = []
     for job in jobs:
         job_name = job['job_name']
         job_salary = job['job_salary']
 
-        content=f'你是一个经验丰富的HR，你的任务是判断当前招聘岗位和薪资水平是否和我所期望的岗位匹配，如果匹配输出true，不匹配则输出false，除了true和false不要输出任何多余的内容，不要对基本信息讨论。以下是基本信息：当前招聘的岗位为“{job_name}”，招聘的岗位薪资为“{job_salary}k”，我所期望的岗位为“{query}”，最低薪资为“{my_job_salary}k”。'
-        ai_res = ai_response(content)
-        print(f"招聘岗位: {job_name}  |  期望岗位: {query}  |  AI判断结果: {ai_res}")
-        if job_name in ['诚聘', '小朋友', '底薪', '月入', '福利', '五险一金', '晋升']:
+        if any(kw in job_name for kw in ['诚聘', '小朋友', '底薪', '月入', '福利', '五险一金', '晋升']):
             continue
-        if ai_res.lower() == "true":
-            position_matchs.append(job)
-            # print(position_matchs)
-    print(f"根据当前数据，系统筛选出符合要求的岗位总数为: {len(position_matchs)} 个。")
-    return position_matchs
+        content=f'你是一个经验丰富的HR，你的任务是判断当前招聘岗位是否适合一个正在寻找第一份实习的2027届计算机专业本科在校生投递，适合输出true，不适合输出false，除了true和false不要输出任何多余的内容。判断标准：1.岗位须适合在校生投递：实习/校招/应届生岗位，或明确接受应届生、经验不限、应往届均可的初级正式岗位（岗位名含"实习"、"校招"、"应届"、"初级"、"助理"、"管培生"、"应往届均可"等字样，或薪资按天计算如"元/天"）；明确要求3年以上经验或高级/资深/架构师岗位输出false；2.岗位方向须为Java/后端/全栈开发相关；3.薪资只设下限不设上限（日薪不低于80元，或月薪不低于2K即可，薪资高不是否决理由）。当前招聘的岗位为"{job_name}"，招聘的岗位薪资为"{job_salary}"。'
+        ai_res = ai_response(content)
+        print(f"招聘岗位: {job_name}  |  薪资: {job_salary}  |  AI判断结果: {ai_res}")
+        if ai_res and ai_res.lower() == "true":
+            matched.append(job)
+    print(f"AI初筛通过 {len(matched)} 个岗位。")
+    return matched
 
 
-def active_hr(boss_url, query, my_job_salary):
+# ---------- 投递 ----------
+
+def deliver_jobs(selected_jobs):
     """
-    获取活跃的HR,HR活跃开始分析工作
-    boss_url: 招聘平台链接
-    query: 岗位名称
-    my_job_salary: 我的期望薪资
+    对勾选的岗位逐个访问详情页，AI深度匹配后打招呼
     """
-    # active_hr_jobs = []
-    #获取工作列表
-    position_matchs = check_position_match(query, my_job_salary)
-    print(f"正在整理分析数据，请耐心等待30-60秒")
-    time.sleep(random.uniform(30, 60))
-    # print(f"当前有效岗位数量为：{len(position_matchs)},-----开始处理")
-    #获取单个工作详情页
-    for job in position_matchs:
-
-        job_link = job['job_link']
-        job_detail = boss_url + job_link
-        wb.get(job_detail)
-        WebDriverWait(wb, 60).until(
-            EC.presence_of_element_located((By.CLASS_NAME, "job-boss-info"))
-        )
-        #bs4解析页面hr活跃度
-        html_content = wb.page_source
-        soup = BeautifulSoup(html_content, "html.parser")
+    boss_url = "https://www.zhipin.com"
+    for job in selected_jobs:
+        job_detail = boss_url + job['job_link']
+        print(f"正在处理岗位: {job['job_name']} | {job['job_salary']}")
         try:
-            if is_hr_online(soup):
-                chat_with_hr(soup)
-            else:
-                hr_active_time = soup.find('span', class_='boss-active-time').text.strip()
-                # print(f"HR活跃时间为：{hr_active_time}")
-                if hr_active_time not in ["本月活跃", "2月内活跃","3月内活跃", "4月内活跃", "5月内活跃", "半年前活跃","近半年活跃"]:
-                    print(f"HR活跃程度为：{hr_active_time},开始分析简历，耐心等待即可")
-                    chat_with_hr(soup)
-                    
-                 #HR在线率搞获取岗位名称开始对比
-                 
-            # active_hr_jobs.append(job)
-            # time.sleep(5)
-        except:
-            print(f"解析失败，跳过当前岗位。")
+            page.get(job_detail)
+            page.wait.ele_displayed('css:.job-boss-info', timeout=60)
+            soup = BeautifulSoup(page.html, "html.parser")
+            chat_with_hr(soup)
+        except Exception as e:
+            print(f"处理失败，跳过当前岗位: {e}")
             time.sleep(5)
             continue
-    
-    # return active_hr_jobs
-def is_hr_online(soup):
-    hr_online_tag = soup.find('span', class_='boss-online-tag')
-    if hr_online_tag and '在线' in hr_online_tag.text.strip():
-        return True
-    return False
+        time.sleep(random.uniform(2, 5))
 
 def chat_with_hr(soup):
     chat_check = check_job_match(soup).strip()
     print(f"AI分析投递结果:{chat_check}")
-    print(f"-----------------------------------------------------------------------------")
-    WebDriverWait(wb, 10).until(
-        EC.element_to_be_clickable((By.CSS_SELECTOR, ".btn.btn-startchat"))
-    )
+    print("-----------------------------------------------------------------------------")
     if chat_check.lower() == "true":
-        startchat_button = wb.find_element(By.CSS_SELECTOR, ".btn.btn-startchat")
-        if startchat_button.is_enabled() and startchat_button.is_displayed():
-            startchat_button = wb.find_element(By.CSS_SELECTOR, ".btn.btn-startchat")
-            wb.execute_script("arguments[0].scrollIntoView(true);", startchat_button)
-            startchat_button.click()
-            time.sleep(8)
+        try:
+            startchat_button = page.ele('css:.btn-startchat', timeout=10)
+            if startchat_button:
+                startchat_button.click()
+                print("已点击立即沟通。")
+                time.sleep(8)
+        except Exception as e:
+            print(f"打招呼按钮点击失败: {e}")
     return
 
 def check_job_match(soup):
@@ -217,7 +182,7 @@ def check_job_match(soup):
     first_response = ai_hr(job_requirements, user_requirements)
     final_analysis = ai_hr(job_requirements, user_requirements, first_response, data_analysis=True)
     print(f"初步分析结果:{first_response}")
-    print(f"-----------------------------------------------------------------------------")
+    print("-----------------------------------------------------------------------------")
     return final_analysis
 
 def get_user_requirements():
@@ -229,20 +194,27 @@ def get_user_requirements():
         raise FileNotFoundError("用户简历文件不存在，请先创建。")
     with open(file_path, "r", encoding="utf-8") as f:
         user_requirements = f.read().strip()
-        # print(user_requirements)
     return user_requirements
-    
+
 
 if __name__ == "__main__":
-    querys = os.getenv("QUERYS").strip().split(",")
-    citys = os.getenv("CITYS").strip().split(",")
-    my_job_salary = os.getenv("MY_JOB_SALARY")
-    boss_url = "https://www.zhipin.com"
+    querys = [q.strip() for q in os.getenv("QUERYS").strip().split(",")]
+    citys = [c.strip() for c in os.getenv("CITYS").strip().split(",")]
+    degree = os.getenv("DEGREE")
     login()
+
+    all_jobs = []
+    seen_links = set()
     for city in citys:
         for query in querys:
-            degree = os.getenv("DEGREE")
+            cityid = get_cityid(city)
             search(query, city, degree)
-            print(f"当前分析岗位：{query}，当前分析城市为：{city}")
-            active_hr(boss_url, query, my_job_salary)
-    wb.quit()
+            print(f"当前采集：{query}，当前城市为：{city}")
+            jobs = get_job_info(query, cityid, degree, seen_links)
+            all_jobs.extend(jobs)
+            time.sleep(random.uniform(3, 6))
+    print(f"共采集 {len(all_jobs)} 个不重复岗位。")
+
+    matched = ai_filter(all_jobs)
+    deliver_jobs(matched)
+    page.quit()
